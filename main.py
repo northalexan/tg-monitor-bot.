@@ -197,4 +197,19 @@ async def main():
     a.add_handler(CommandHandler("negative",cmd_negative))
     a.add_handler(CommandHandler("status",cmd_status))
     await a.run_polling(allowed_updates=[])
-if __name__=="__main__": asyncio.run(main())
+import asyncio
+from telegram.ext import ApplicationBuilder, CommandHandler
+
+async def start(update, context):
+    await update.message.reply_text("Бот запущен и работает!")
+
+async def main():
+    app = ApplicationBuilder().token("ТОКЕН_ТВОЕГО_БОТА").build()
+
+    app.add_handler(CommandHandler("start", start))
+
+    print("✅ Бот запущен. Ожидаю команды...")
+    await app.run_polling()
+
+if __name__ == "__main__":
+    asyncio.run(main())
