@@ -1,4 +1,4 @@
-print("BOOT:", os.environ.get("RENDER_GIT_COMMIT", "no-commit"), datetime.utcnow().isoformat(timespec="seconds")+"Z")import os, re, sqlite3, asyncio, logging, requests
+import os, re, sqlite3, asyncio, logging, requests
 from datetime import datetime
 from cryptography.fernet import Fernet
 from telethon import TelegramClient, events
@@ -216,10 +216,12 @@ async def cmd_status(update, context):
     await update.message.reply_text(str(dict(s)) if s else "Нет сессии.")
 
 # -------- ENTRYPOINT ----------
-async def serve():
-    init_db()
-    app = Application.builder().token(BOT_TOKEN).build()
+# ... все твои функции выше остаются без изменений ...
 
+async def main():
+    init_db()
+    await start_keepalive()
+    app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("connect", cmd_connect))
     app.add_handler(CommandHandler("phone", cmd_phone))
@@ -229,15 +231,12 @@ async def serve():
     app.add_handler(CommandHandler("negative", cmd_negative))
     app.add_handler(CommandHandler("status", cmd_status))
 
-    # ВАЖНО: ручной жизненный цикл без run_polling (чтобы не падать на event loop)
+    # ручной запуск без закрытия event loop
     await app.initialize()
     await app.start()
-    await app.updater.start_polling(allowed_updates=[])
-    try:
-        await app.updater.wait_until_closed()
-    finally:
-        await app.stop()
-        await app.shutdown()
+    await app.updater.start_polling()
+    await asyncio.Future()  # не даём процессу завершиться
 
 if __name__ == "__main__":
-    asyncio.run(serve())
+    import asyncio
+    asyncio.run(main())
