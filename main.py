@@ -4,6 +4,7 @@ import sqlite3
 import asyncio
 import logging
 from datetime import datetime
+from telethon.tl import functions
 
 import requests
 from cryptography.fernet import Fernet
@@ -107,24 +108,21 @@ def dec(b: bytes) -> bytes:
 # LOGIN FLOW
 # =========================
 async def start_login(tg_id: int, phone: str) -> str:
-    """Шаг 1: отправляем код, сохраняем временную сессию и phone_code_hash."""
     sess = StringSession()
     client = TelegramClient(sess, API_ID, API_HASH)
     await client.connect()
     try:
-        sent = await client.send_code_request(phone)  # вернёт phone_code_hash
+        sent = await client.send_code_request(phone)  # <- получаем хэш
     except PhoneNumberInvalidError:
         await client.disconnect()
         return "Телефон некорректен. Формат: /phone +79991234567"
-
     tmp = sess.save()
     with db() as c:
-        c.execute(
-            "REPLACE INTO pending(tg_id, tmp_enc_session, phone, code_hash, sent_at) VALUES (?, ?, ?, ?, ?)",
-            (tg_id, enc(tmp.encode()), phone, getattr(sent, "phone_code_hash", None), now_iso()),
-        )
+        c.execute("""REPLACE INTO pending(tg_id,tmp_enc_session,phone,sent_at,code_hash)
+                     VALUES(?,?,?,?,?)""",
+                  (tg_id, enc(tmp.encode()), phone, now_iso(), sent.phone_code_hash))
     await client.disconnect()
-    return "Код отправлен. Введите /code 12345"
+    return "Код отправлен. Введите /code 12345 (только цифры)."
 
 
 async def resend_code(tg_id: int) -> str:
@@ -151,60 +149,37 @@ async def resend_code(tg_id: int) -> str:
 
 
 async def confirm_code(tg_id: int, code: str) -> str:
-    """Шаг 2: подтверждаем код, используя сохранённый phone_code_hash."""
     with db() as c:
         p = c.execute("SELECT * FROM pending WHERE tg_id=?", (tg_id,)).fetchone()
     if not p:
-        return "Нет активной попытки. Сначала /connect"
-
+        return "Нет активной попытки. Набери /connect и укажи телефон."
     tmp = StringSession(dec(p["tmp_enc_session"]).decode())
     client = TelegramClient(tmp, API_ID, API_HASH)
     await client.connect()
     try:
-        clean_code = re.sub(r"\D", "", code).strip()
-
-        # если по какой-то причине hash пустой — сразу переотправим код
-        if not p["code_hash"]:
-            await client.disconnect()
-            msg = await resend_code(tg_id)
-            return "Нужен новый код. " + msg
-
-        await client.sign_in(
-            phone=p["phone"],
-            code=clean_code,
-            phone_code_hash=p["code_hash"],
-        )
-    except PhoneCodeExpiredError:
-        await client.disconnect()
-        msg = await resend_code(tg_id)
-        return "Код просрочен. " + msg
-    except PhoneCodeInvalidError:
-        await client.disconnect()
-        return "Неверный код. Проверь цифры и пришли ещё раз: /code 12345"
+        # передаём И телефон, И код, И phone_code_hash
+        await client.sign_in(phone=p["phone"], code=code.strip(), phone_code_hash=p["code_hash"])
     except SessionPasswordNeededError:
         await client.disconnect()
-        return "Включена двухэтапка. Введите /password ваш_пароль"
-    except ValueError:
+        return "Включена двухэтапка. Введи /password <пароль>."
+    except PhoneCodeInvalidError:
         await client.disconnect()
-        return "Код отклонён. Повтори: /connect → /phone → /code (нужен новый код)."
+        return "Неверный код. Попробуй ещё раз или /resend чтобы выслать новый."
+    except PhoneCodeExpiredError:
+        await client.disconnect()
+        return "Код просрочен. Набери /resend, вышлю новый."
     except FloodWaitError as e:
         await client.disconnect()
-        return f"Слишком часто. Подождите {e.seconds} сек."
-
+        return f"Слишком часто. Подожди {e.seconds} сек."
     s = client.session.save()
     await client.disconnect()
-
     with db() as c:
         c.execute("DELETE FROM pending WHERE tg_id=?", (tg_id,))
-        c.execute(
-            """REPLACE INTO sessions(tg_id, enc_session, phone, created_at)
-               VALUES(?, ?, ?, ?)""",
-            (tg_id, enc(s.encode()), p["phone"], now_iso()),
-        )
-
+        c.execute("""REPLACE INTO sessions(tg_id,enc_session,phone,created_at)
+                     VALUES(?,?,?,?)""",
+                  (tg_id, enc(s.encode()), p["phone"], now_iso()))
     asyncio.create_task(run_monitor_for_user(tg_id))
     return "✅ Подключено! Мониторинг запущен."
-
 
 async def confirm_password(tg_id: int, pwd: str) -> str:
     """Шаг 2b: если включена 2FA — принимаем пароль и завершаем логин."""
@@ -236,6 +211,29 @@ async def confirm_password(tg_id: int, pwd: str) -> str:
     asyncio.create_task(run_monitor_for_user(tg_id))
     return "✅ Пароль принят. Мониторинг запущен."
 
+
+async def resend_code(tg_id: int) -> str:
+    with db() as c:
+        p = c.execute("SELECT * FROM pending WHERE tg_id=?", (tg_id,)).fetchone()
+    if not p:
+        return "Нет активной попытки логина. Набери /connect."
+    tmp = StringSession(dec(p["tmp_enc_session"]).decode())
+    client = TelegramClient(tmp, API_ID, API_HASH)
+    await client.connect()
+    try:
+        # Телеграм может требовать старый хэш для корректного ресенда
+        if p["code_hash"]:
+            r = await client(functions.auth.ResendCodeRequest(phone_number=p["phone"], phone_code_hash=p["code_hash"]))
+            new_hash = r.phone_code_hash
+        else:
+            sent = await client.send_code_request(p["phone"])
+            new_hash = sent.phone_code_hash
+    finally:
+        await client.disconnect()
+    with db() as c:
+        c.execute("UPDATE pending SET code_hash=?, sent_at=? WHERE tg_id=?",
+                  (new_hash, now_iso(), tg_id))
+    return "Отправил новый код. Введи /code 12345."
 
 # =========================
 # MONITOR
@@ -403,6 +401,7 @@ async def main():
     # Предочистка: убираем вебхук и сбрасываем подвисшие апдейты
     await application.bot.delete_webhook(drop_pending_updates=True)
     await application.start()
+
 
     # Защита от параллельного polling (409 Conflict)
     while True:
