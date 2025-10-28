@@ -58,40 +58,23 @@ def db():
 def init_db():
     os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
     with db() as c:
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS users(
-                tg_id INTEGER PRIMARY KEY,
-                created_at TEXT
-            )
-            """
-        )
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS sessions(
-                tg_id INTEGER PRIMARY KEY,
-                enc_session BLOB NOT NULL,
-                phone TEXT,
-                keywords TEXT DEFAULT '',
-                negative TEXT DEFAULT '',
-                only_public INTEGER DEFAULT 0,
-                webhook TEXT DEFAULT '',
-                created_at TEXT
-            )
-            """
-        )
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS pending(
-                tg_id INTEGER PRIMARY KEY,
-                tmp_enc_session BLOB NOT NULL,
-                phone TEXT NOT NULL,
-                sent_at TEXT NOT NULL
-            )
-            """
-        )
-
-
+        c.execute("""CREATE TABLE IF NOT EXISTS users(
+          tg_id INTEGER PRIMARY KEY, created_at TEXT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS sessions(
+          tg_id INTEGER PRIMARY KEY, enc_session BLOB NOT NULL,
+          phone TEXT, keywords TEXT DEFAULT '', negative TEXT DEFAULT '',
+          only_public INTEGER DEFAULT 0, webhook TEXT DEFAULT '', created_at TEXT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS pending(
+          tg_id INTEGER PRIMARY KEY,
+          tmp_enc_session BLOB NOT NULL,
+          phone TEXT NOT NULL,
+          code_hash TEXT,
+          sent_at TEXT NOT NULL)""")
+        # Проверка и добавление колонки code_hash, если её нет
+        cols = [r["name"] for r in c.execute("PRAGMA table_info(pending)").fetchall()]
+        if "code_hash" not in cols:
+            c.execute("ALTER TABLE pending ADD COLUMN code_hash TEXT")
+            
 def now_iso():
     return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
@@ -112,7 +95,7 @@ async def start_login(tg_id: int, phone: str) -> str:
     client = TelegramClient(sess, API_ID, API_HASH)
     await client.connect()
     try:
-        await client.send_code_request(phone)
+        sent = await client.send_code_request(phone)  # сохраняем phone_code_hash
     except PhoneNumberInvalidError:
         await client.disconnect()
         return "Телефон некорректен. Формат: /phone +79991234567"
@@ -120,8 +103,8 @@ async def start_login(tg_id: int, phone: str) -> str:
     tmp = sess.save()
     with db() as c:
         c.execute(
-            "REPLACE INTO pending(tg_id, tmp_enc_session, phone, sent_at) VALUES (?, ?, ?, ?)",
-            (tg_id, enc(tmp.encode()), phone, now_iso()),
+            "REPLACE INTO pending(tg_id,tmp_enc_session,phone,code_hash,sent_at) VALUES(?,?,?,?,?)",
+            (tg_id, enc(tmp.encode()), phone, getattr(sent, "phone_code_hash", None), now_iso())
         )
     await client.disconnect()
     return "Код отправлен. Введите /code 12345"
@@ -152,7 +135,11 @@ async def confirm_code(tg_id: int, code: str) -> str:
         return f"Слишком часто. Подождите {e.seconds} сек."
 
     s = client.session.save()
-    await client.disconnect()
+    await client.sign_in(
+    phone=p["phone"],
+    code=code.strip(),
+    phone_code_hash=p["code_hash"]
+    )
 
     with db() as c:
         c.execute("DELETE FROM pending WHERE tg_id=?", (tg_id,))
