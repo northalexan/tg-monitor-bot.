@@ -1,4 +1,4 @@
-import os, re, sqlite3, asyncio, logging, requests
+print("BOOT:", os.environ.get("RENDER_GIT_COMMIT", "no-commit"), datetime.utcnow().isoformat(timespec="seconds")+"Z")import os, re, sqlite3, asyncio, logging, requests
 from datetime import datetime
 from cryptography.fernet import Fernet
 from telethon import TelegramClient, events
