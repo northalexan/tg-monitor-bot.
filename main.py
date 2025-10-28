@@ -139,7 +139,7 @@ async def confirm_code(tg_id: int, code: str) -> str:
     phone=p["phone"],
     code=code.strip(),
     phone_code_hash=p["code_hash"]
-    )
+)
 
     with db() as c:
         c.execute("DELETE FROM pending WHERE tg_id=?", (tg_id,))
