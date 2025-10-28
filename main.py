@@ -20,6 +20,7 @@ from telethon.errors import (
 )
 
 from telegram.ext import Application, CommandHandler
+from telegram.error import Conflict
 
 # =========================
 # ENV
@@ -34,16 +35,14 @@ DB_PATH = os.environ.get("DB_PATH", "data.db")
 FERNET_KEY = os.environ.get("FERNET_KEY")
 if not FERNET_KEY:
     FERNET_KEY = Fernet.generate_key().decode()
-    # Один раз возьми ключ из логов и добавь в Environment -> FERNET_KEY
     print("FERNET_KEY (добавь в Environment):", FERNET_KEY)
 
-# Fernet ждёт bytes
 fernet = Fernet(FERNET_KEY.encode() if isinstance(FERNET_KEY, str) else FERNET_KEY)
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("tg-monitor")
 
-# Активные Telethon-клиенты (чтобы их не убивал GC)
+# Активные Telethon-клиенты (не даём их собирать GC)
 ACTIVE_CLIENTS = {}  # tg_id -> TelegramClient
 
 
@@ -108,6 +107,7 @@ def dec(b: bytes) -> bytes:
 # LOGIN FLOW
 # =========================
 async def start_login(tg_id: int, phone: str) -> str:
+    """Шаг 1: отправляем код, сохраняем временную сессию и phone_code_hash."""
     sess = StringSession()
     client = TelegramClient(sess, API_ID, API_HASH)
     await client.connect()
@@ -127,7 +127,31 @@ async def start_login(tg_id: int, phone: str) -> str:
     return "Код отправлен. Введите /code 12345"
 
 
+async def resend_code(tg_id: int) -> str:
+    """Переотправка кода и обновление code_hash в pending."""
+    with db() as c:
+        p = c.execute("SELECT tmp_enc_session, phone FROM pending WHERE tg_id=?", (tg_id,)).fetchone()
+    if not p:
+        return "Нет активной попытки. Сначала /connect"
+
+    sess = StringSession(dec(p["tmp_enc_session"]).decode())
+    client = TelegramClient(sess, API_ID, API_HASH)
+    await client.connect()
+    try:
+        sent = await client.send_code_request(p["phone"])
+    finally:
+        await client.disconnect()
+
+    with db() as c:
+        c.execute(
+            "UPDATE pending SET code_hash=?, sent_at=? WHERE tg_id=?",
+            (getattr(sent, "phone_code_hash", None), now_iso(), tg_id),
+        )
+    return "Отправил новый код. Введите /code 12345 (используй самый последний)."
+
+
 async def confirm_code(tg_id: int, code: str) -> str:
+    """Шаг 2: подтверждаем код, используя сохранённый phone_code_hash."""
     with db() as c:
         p = c.execute("SELECT * FROM pending WHERE tg_id=?", (tg_id,)).fetchone()
     if not p:
@@ -137,23 +161,32 @@ async def confirm_code(tg_id: int, code: str) -> str:
     client = TelegramClient(tmp, API_ID, API_HASH)
     await client.connect()
     try:
+        clean_code = re.sub(r"\D", "", code).strip()
+
+        # если по какой-то причине hash пустой — сразу переотправим код
+        if not p["code_hash"]:
+            await client.disconnect()
+            msg = await resend_code(tg_id)
+            return "Нужен новый код. " + msg
+
         await client.sign_in(
             phone=p["phone"],
-            code=code.strip(),
-            phone_code_hash=p["code_hash"],  # важно!
+            code=clean_code,
+            phone_code_hash=p["code_hash"],
         )
-    except SessionPasswordNeededError:
-        await client.disconnect()
-        return "Включена двухэтапка. Введите /password ваш пароль"
-    except PhoneCodeInvalidError:
-        await client.disconnect()
-        return "Неверный код"
     except PhoneCodeExpiredError:
         await client.disconnect()
-        return "Код просрочен. Начните заново: /connect"
+        msg = await resend_code(tg_id)
+        return "Код просрочен. " + msg
+    except PhoneCodeInvalidError:
+        await client.disconnect()
+        return "Неверный код. Проверь цифры и пришли ещё раз: /code 12345"
+    except SessionPasswordNeededError:
+        await client.disconnect()
+        return "Включена двухэтапка. Введите /password ваш_пароль"
     except ValueError:
         await client.disconnect()
-        return "Код отклонён. Повтори /connect → /phone → /code (нужен новый код)."
+        return "Код отклонён. Повтори: /connect → /phone → /code (нужен новый код)."
     except FloodWaitError as e:
         await client.disconnect()
         return f"Слишком часто. Подождите {e.seconds} сек."
@@ -174,6 +207,7 @@ async def confirm_code(tg_id: int, code: str) -> str:
 
 
 async def confirm_password(tg_id: int, pwd: str) -> str:
+    """Шаг 2b: если включена 2FA — принимаем пароль и завершаем логин."""
     with db() as c:
         p = c.execute("SELECT * FROM pending WHERE tg_id=?", (tg_id,)).fetchone()
     if not p:
@@ -207,7 +241,7 @@ async def confirm_password(tg_id: int, pwd: str) -> str:
 # MONITOR
 # =========================
 async def run_monitor_for_user(tg_id: int):
-    # если уже запущен — не дублируем
+    """Старт фонового мониторинга входящих сообщений для пользователя."""
     if tg_id in ACTIVE_CLIENTS:
         return
 
@@ -268,7 +302,8 @@ async def run_monitor_for_user(tg_id: int):
 # =========================
 async def cmd_start(update, context):
     await update.message.reply_text(
-        "Привет! /connect чтобы подключить аккаунт. Дальше: /phone +79991234567 → /code 12345 (или /password ...)"
+        "Привет! /connect чтобы подключить аккаунт. Дальше: /phone +79991234567 → /code 12345 (или /password ...)\n"
+        "Если код не приходит/просрочен: /resend"
     )
 
 
@@ -294,6 +329,11 @@ async def cmd_password(update, context):
     if not context.args:
         return await update.message.reply_text("Формат: /password ваш_пароль")
     msg = await confirm_password(update.effective_user.id, " ".join(context.args))
+    await update.message.reply_text(msg)
+
+
+async def cmd_resend(update, context):
+    msg = await resend_code(update.effective_user.id)
     await update.message.reply_text(msg)
 
 
@@ -354,14 +394,24 @@ async def main():
     application.add_handler(CommandHandler("phone", cmd_phone))
     application.add_handler(CommandHandler("code", cmd_code))
     application.add_handler(CommandHandler("password", cmd_password))
+    application.add_handler(CommandHandler("resend", cmd_resend))
     application.add_handler(CommandHandler("keywords", cmd_keywords))
     application.add_handler(CommandHandler("negative", cmd_negative))
     application.add_handler(CommandHandler("status", cmd_status))
 
-    # Ручной запуск без закрытия loop — чтобы не ловить "event loop is already running"
     await application.initialize()
+    # Предочистка: убираем вебхук и сбрасываем подвисшие апдейты
+    await application.bot.delete_webhook(drop_pending_updates=True)
     await application.start()
-    await application.updater.start_polling()
+
+    # Защита от параллельного polling (409 Conflict)
+    while True:
+        try:
+            await application.updater.start_polling()
+            break
+        except Conflict:
+            print("Another polling instance detected. Retrying in 5s…")
+            await asyncio.sleep(5)
 
     print("✅ Бот запущен. Ожидаю команды…")
     await asyncio.Future()  # удерживаем процесс
