@@ -204,7 +204,7 @@ async def start(update, context):
     await update.message.reply_text("Бот запущен и работает!")
 
 async def main():
-    app = ApplicationBuilder().token("ТОКЕН_ТВОЕГО_БОТА").build()
+    app = ApplicationBuilder().token("7710231543:AAHW5dmX65akJ1UprfOaE1DCwgNPgxVIHWM").build()
 
     app.add_handler(CommandHandler("start", start))
 
